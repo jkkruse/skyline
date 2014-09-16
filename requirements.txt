@@ -5,4 +5,5 @@ flask==0.9
 simplejson==2.0.9
 unittest2
 mock
+kyotocabinet==1.18
 #python-simple-hipchat

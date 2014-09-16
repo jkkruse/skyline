@@ -1,5 +1,28 @@
 ## Skyline
 
+This adds some holt-winters functionality as an additional screen after the 
+basic ensemble has voted.  I've seen it filter about 75% of items that normally
+alert.
+
+I used kyotocabinet to store holt-winters history since redis would not work 
+the large footprint that would be created.
+
+* kyotocabinet-1.2.76.tar.gz
+* kyotocabinet-python-legacy-1.18.tar.gz
+
+To limit the cabinet size I created 2 update scripts, one that runs twice a day
+to pull data out of redis and update cabinets and another that runs weekly to
+clean out old cabinet data.  The weekly job creates a new cabinet file as the 
+removal of data from the cabinet doesn't reclaim disk space.
+
+* repack-cabinet.py
+* update-cabinet.py
+
+Our environment has about 30,000 metrics that screen.  Times on the secondary
+screening are reasonable in the 30-50% increase in duration from the 
+more simple tests. 
+
+
 [![Build Status](https://travis-ci.org/etsy/skyline.svg)](https://travis-ci.org/etsy/skyline)
 
 ![x](https://raw.github.com/etsy/skyline/master/screenshot.png)

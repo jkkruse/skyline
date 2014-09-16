@@ -5,8 +5,15 @@ import statsmodels.api as sm
 import traceback
 import logging
 from time import time
-from msgpack import unpackb, packb
+from msgpack import unpackb, packb, Unpacker
 from redis import StrictRedis
+
+import math
+from os import getpid
+import re
+
+from kyotocabinet import *
+
 
 from settings import (
     ALGORITHMS,
@@ -290,7 +297,12 @@ def run_selected_algorithm(timeseries, metric_name):
         threshold = len(ensemble) - CONSENSUS
         if ensemble.count(False) <= threshold:
             if ENABLE_SECOND_ORDER:
+                count = int(redis_conn.get('holtfalse'))
+                count = count + 1
+                redis_conn.set('holtfalse', count)
                 if is_anomalously_anomalous(metric_name, ensemble, timeseries[-1][1]):
+                    return True, ensemble, timeseries[-1][1]
+                if verify_holt_winters(metric_name) >= 4:
                     return True, ensemble, timeseries[-1][1]
             else:
                 return True, ensemble, timeseries[-1][1]
@@ -299,3 +311,142 @@ def run_selected_algorithm(timeseries, metric_name):
     except:
         logging.error("Algorithm error: " + traceback.format_exc())
         return False, [], 1
+
+
+def get_holt_from_cabinet(full_holt_series, db):
+
+    # Load what we know
+    known_metrics = {}
+    for value in full_holt_series:
+        known_metrics[str(value[0])] = 1
+
+    two_weeks = time() - 1209600
+    rec_count = 0
+    # traverse records
+    cur = db.cursor()
+    cur.jump()
+    while True:
+        # This is the oldest record in our cabinet
+        rec = cur.get(True)
+        if not rec: break
+        if rec_count == 0:
+            # If our first time through see if the oldest record
+            # in the cabinet is located in our redis record
+            # If we have seen it we can fill in the blanks from
+            # our last day of redis data
+            if known_metrics.has_key(str(rec[0])):
+                break
+            # Fill in our list with only the contents of the cabinet
+            else:
+                full_holt_series = []
+            rec_count += 1
+        if float(rec[0]) > two_weeks:
+            full_holt_series.append((float(rec[0]), float(rec[1])))
+
+    cur.disable()
+    return full_holt_series
+
+def verify_holt_winters(metric_name):
+    HOLT_CACHE_DURATION = 1800
+    HOLT_WINTERS_COUNT = 4
+    CABINET = "/opt/skyline/src/cabinet"
+    full_holt_series = []
+    known_metrics = {}
+    recent_holt_time = time() - HOLT_CACHE_DURATION
+
+    db = DB()
+
+    if not db.open(CABINET + "/" + metric_name + ".kct", DB.OREADER | DB.ONOLOCK):
+        return HOLT_WINTERS_COUNT
+
+    seen_holt = redis_conn.get('holt_' + metric_name)
+
+    # We've put a holt_ record in redis for this metric
+    if seen_holt is not None:
+        full_holt_series = unpackb(seen_holt)
+        # The last item in the series was seen > HOLT_CACHE_DURATION ago
+        if full_holt_series[-1][0] < recent_holt_time:
+            full_holt_series = get_holt_from_cabinet(full_holt_series, db)
+    else:
+        full_holt_series = get_holt_from_cabinet(full_holt_series, db)
+
+    for value in full_holt_series:
+        known_metrics[str(value[0])] = 1
+
+    db.close()
+
+    # Add the last FULL_DURATION to the cabinet data for any missing items
+    raw_metric = redis_conn.mget(metric_name)
+    for i, local_metric in enumerate(raw_metric):
+        unpacker = Unpacker(use_list = False)
+        unpacker.feed(local_metric)
+        potential_new = list(unpacker)
+        for value in potential_new:
+            if not known_metrics.has_key(str(value[0])):
+                full_holt_series.append((float(value[0]), float(value[1])))
+
+    redis_conn.set('holt_' + metric_name, packb(full_holt_series))
+
+    count = holtWintersDeviants(full_holt_series)
+    return count
+
+
+#
+# Copied from https://gist.github.com/andrequeiroz
+#
+# This assumes a regular series input with few gaps
+#
+def holtWintersDeviants(full_holt_series):
+    #info = additive(x, 2880, 1, 0.1, 0.0035, 0.1)
+    # (24 * 60 * 60) (1 season) / 30 (step length)
+    # or, we measure at 30 second intervals over a day
+    # TODO: Dynamically determine the interval from the series
+    m = 2880
+    alpha = 0.1
+    beta  = 0.0035
+    gamma = 0.1
+    Y = []
+ 
+    Y = [full_holt_series[i][1] for i,values in enumerate(full_holt_series)]
+ 
+    previous_a = sum(Y[0:m]) / float(m)
+    previous_b = (sum(Y[m:2 * m]) - sum(Y[0:m])) / m ** 2
+    s = [Y[i] - previous_a for i in range(m)]
+    d = [0 for i in range(m)]
+    y = [previous_a + previous_b + s[0]]
+ 
+    rmse = 0
+
+    # Find how long our number is, try to get about 1% as a min deviation
+    if previous_a > 100:
+        place_compare = previous_a / 300
+    else:
+        places = len(str(int(previous_a)))
+        places -= 1 
+        place_compare = (float(10 ** places) / 10)
+     
+    for i in range(len(Y)):
+        try: 
+            current_a = (alpha * (Y[i] - s[i]) + (1 - alpha) * (previous_a + previous_b))
+            current_b = (beta * (current_a - previous_a) + (1 - beta) * previous_b)
+            s.append(gamma * (Y[i] - previous_a - previous_b) + (1 - gamma) * s[i])
+            y.append(current_a + current_b + s[i + 1])
+            d.append(gamma * math.fabs(Y[i] - y[i]) + (1 - gamma) * d[i])
+            previous_a = current_a
+            previous_b = current_b
+ 
+            if (d[-1] < place_compare):
+                d[-1] =  place_compare
+        except: 
+            break
+ 
+    deviant_count = 0
+    for i in range(len(Y) - 30, len(Y) - 1):
+        info = full_holt_series[i]
+        hi = y[i] + 3 * d[i+m]
+        lo = y[i] - 3 * d[i+m]
+        if ((hi > Y[i]) and ((Y[i] + .1) > lo)):
+            continue
+        deviant_count += 1
+ 
+    return deviant_count

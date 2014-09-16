@@ -12,6 +12,7 @@ import traceback
 import operator
 import socket
 import settings
+import re
 
 from alerters import trigger_alert
 from algorithms import run_selected_algorithm
@@ -85,6 +86,12 @@ class Analyzer(Thread):
         for i, metric_name in enumerate(assigned_metrics):
             self.check_if_parent_is_alive()
 
+	    # Static exclusion
+            # TODO: Make this a configuration item
+            if (re.search('veritas', metric_name) and not re.search('yen', metric_name)):
+                  exceptions['VeritasSkipped'] += 1
+                  continue
+
             try:
                 raw_series = raw_assigned[i]
                 unpacker = Unpacker(use_list = False)
@@ -143,6 +150,9 @@ class Analyzer(Thread):
 
             # Discover unique metrics
             unique_metrics = list(self.redis_conn.smembers(settings.FULL_NAMESPACE + 'unique_metrics'))
+
+            # Clear out the count of screen hits from holt-winters
+            self.redis_conn.set('holtfalse', int(0))
 
             if len(unique_metrics) == 0:
                 logger.info('no metrics in redis. try adding some - see README')
@@ -214,9 +224,11 @@ class Analyzer(Thread):
             logger.info('seconds to run    :: %.2f' % (time() - now))
             logger.info('total metrics     :: %d' % len(unique_metrics))
             logger.info('total analyzed    :: %d' % (len(unique_metrics) - sum(exceptions.values())))
+            logger.info('secondary screen  :: %s' % self.redis_conn.get('holtfalse'))
             logger.info('total anomalies   :: %d' % len(self.anomalous_metrics))
             logger.info('exception stats   :: %s' % exceptions)
             logger.info('anomaly breakdown :: %s' % anomaly_breakdown)
+            self.redis_conn.set('holtfalse', int(0))
 
             # Log to Graphite
             self.send_graphite_metric('skyline.analyzer.run_time', '%.2f' % (time() - now))
